@@ -1,0 +1,12 @@
+import mongoose from "mongoose";
+
+const ConnectDb=async()=>{
+try {
+   await mongoose.connect("mongodb://locahost:27017/flash_sale")
+} catch (error) {
+   console.log(error);
+   
+   process.exit(1);
+
+}
+}
