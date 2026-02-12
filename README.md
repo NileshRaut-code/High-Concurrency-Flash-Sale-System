@@ -83,7 +83,7 @@ sequenceDiagram
         API-->>Client: 409 Out of Stock
     end
 ```
-
+![Check Out Output](image.png)
 ---
 
 ## 💳 Payment Flow
@@ -94,7 +94,7 @@ flowchart TB
     RESERVED -->|Payment Fail| CANCELLED
     RESERVED -->|TTL Expired| CANCELLED
 ```
-
+![Payment Flow](image-1.png)
 ---
 
 ## ⏱️ Timeout & Token Revoke (Hybrid)
@@ -108,7 +108,7 @@ flowchart LR
 
     Revoke --> RedisStock[Return Tokens to Redis]
 ```
-
+![cron/Redis Clean Up](image-2.png)
 > **TTL is truth, events are optimization, cron is safety**
 
 ---
