@@ -91,8 +91,8 @@ sequenceDiagram
 ```mermaid
 flowchart TB
     RESERVED -->|Payment Success| PAID
-    RESERVED -->|Payment Fail| CANCELLED --> Revoke the Token
-    RESERVED -->|TTL Expired| CANCELLED  --> Revoke the Token
+    RESERVED -->|Payment Fail| CANCELLED
+    RESERVED -->|TTL Expired| CANCELLED
 ```
 ![Payment Flow](image-1.png)
 ---
