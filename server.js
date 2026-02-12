@@ -13,6 +13,10 @@ app.use(express.json());
 app.post("/seed/product", async (req, res) => {
   const { productId, quantity } = req.body;
 
+  if (!productId || !quantity || quantity <= 0) {
+    return res.status(400).json({ message: "Invalid input" });
+  }
+
   const existing = await redis.llen(`stock:${productId}`);
   if (existing > 0) {
     return res.json({ message: "Already seeded" });
@@ -27,6 +31,10 @@ app.post("/seed/product", async (req, res) => {
 
 app.post("/cart/add", async (req, res) => {
   const { userId, productId, quantity } = req.body;
+
+  if (!userId || !productId || !quantity || quantity <= 0) {
+    return res.status(400).json({ message: "Invalid input" });
+  }
 
   const token = await redis.eval(
     RESERVE_LUA,
@@ -50,25 +58,31 @@ app.post("/cart/add", async (req, res) => {
     quantity,
     redisReservationKey: reservationKey,
     reservedToken: token,
+    status: "active",
     expireAt: new Date(Date.now() + ttlSeconds * 1000)
   });
 
   res.json({
     message: "Added to cart",
     cartId: cart._id,
-    expiresIn: "5 minutes"
+    expiresIn: ttlSeconds
   });
 });
 
 app.post("/order/create", async (req, res) => {
   const { cartId } = req.body;
 
-  const cart = await Cart.findById(cartId);
-  if (!cart) {
-    return res.status(404).json({ message: "Cart not found" });
+  if (!cartId) {
+    return res.status(400).json({ message: "Invalid input" });
   }
 
-  if (cart.status !== "active") {
+  const cart = await Cart.findOneAndUpdate(
+    { _id: cartId, status: "active" },
+    { status: "checkout" },
+    { new: true }
+  );
+
+  if (!cart) {
     return res.status(400).json({ message: "Cart is not active" });
   }
 
@@ -82,15 +96,13 @@ app.post("/order/create", async (req, res) => {
   const order = await Order.create({
     userId: cart.userId,
     productId: cart.productId,
+    cartId: cart._id,
     quantity: cart.quantity,
     amount: cart.quantity * 100,
     status: "pending_payment",
     razorpayOrderId: null,
     paymentId: null
   });
-
-  cart.status = "checkout";
-  await cart.save();
 
   res.json({
     message: "Order created successfully",
@@ -100,6 +112,10 @@ app.post("/order/create", async (req, res) => {
 
 app.post("/checkout/payment", async (req, res) => {
   const { cartId } = req.body;
+
+  if (!cartId) {
+    return res.status(400).json({ message: "Invalid input" });
+  }
 
   const cart = await Cart.findById(cartId);
   if (!cart || cart.status !== "checkout") {
@@ -112,9 +128,21 @@ app.post("/checkout/payment", async (req, res) => {
 app.post("/payment/verify", async (req, res) => {
   const { orderId } = req.body;
 
+  if (!orderId) {
+    return res.status(400).json({ message: "Invalid input" });
+  }
+
   const order = await Order.findById(orderId);
-  if (!order || order.status !== "pending_payment") {
-    return res.status(400).json({ message: "Invalid order" });
+  if (!order) {
+    return res.status(404).json({ message: "Order not found" });
+  }
+
+  if (order.status === "paid") {
+    return res.json({ message: "Already processed" });
+  }
+
+  if (order.status !== "pending_payment") {
+    return res.status(400).json({ message: "Invalid order state" });
   }
 
   order.status = "paid";
@@ -126,27 +154,31 @@ app.post("/payment/verify", async (req, res) => {
 });
 
 cron.schedule("*/1 * * * *", async () => {
-  const now = new Date();
+  try {
+    const now = new Date();
 
-  const expiredCarts = await Cart.find({
-    status: "active",
-    expireAt: { $lte: now }
-  });
+    const expiredCarts = await Cart.find({
+      status: "active",
+      expireAt: { $lte: now }
+    });
 
-  for (const cart of expiredCarts) {
-    if (cart.status !== "active") continue;
+    for (const cart of expiredCarts) {
+      if (cart.status !== "active") continue;
 
-    await redis.eval(
-      ROLLBACK_LUA,
-      1,
-      `stock:${cart.productId}`,
-      cart.quantity
-    );
+      await redis.eval(
+        ROLLBACK_LUA,
+        1,
+        `stock:${cart.productId}`,
+        cart.quantity
+      );
 
-    await redis.del(cart.redisReservationKey);
+      await redis.del(cart.redisReservationKey);
 
-    cart.status = "expired";
-    await cart.save();
+      cart.status = "expired";
+      await cart.save();
+    }
+  } catch (err) {
+    console.error("Cron error:", err);
   }
 });
 
