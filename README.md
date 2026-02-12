@@ -161,8 +161,7 @@ flowchart TB
 
     classDef bad fill:#ffdddd,stroke:#ff0000;
 ```
-(High concurrency inventory system, Redis Lua atomic reservation, flash sale system design)[https://nileshblog.tech/designing-a-high-concurrency-flash-sale-stock-inventory-reservation-system-with-node-js-redis-lua-and-mongodb/
-]
+[High concurrency inventory system, Redis Lua atomic reservation, flash sale system design](https://nileshblog.tech/designing-a-high-concurrency-flash-sale-stock-inventory-reservation-system-with-node-js-redis-lua-and-mongodb/)
 ---
 
 ## 🏁 Final Mental Model
