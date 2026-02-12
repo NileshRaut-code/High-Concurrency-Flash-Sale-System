@@ -213,10 +213,5 @@ node server.js
 
 ---
 
-## 👨‍💻 Author
-
-High Flash Sale System v1.0.0
-
 ---
 
-**Happy Selling! 🎉**
