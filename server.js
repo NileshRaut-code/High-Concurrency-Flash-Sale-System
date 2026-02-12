@@ -1,192 +1,187 @@
 import express from "express";
-import cron from "node-cron";
-import { randomUUID } from "crypto";
-import { ConnectDb } from "./Mongodb.js";
-import { redis } from "./redis.js";
-import { RESERVE_LUA, ROLLBACK_LUA } from "./reservation.lua.js";
-import { Order } from "./model/Order.js";
+import { redis, subscriber } from "./redis.js";
+import  {ConnectDb} from "./Mongodb.js";
+import { RESERVE_STOCK_LUA, REVOKE_STOCK_LUA } from "./reservation.lua.js";
+import { Product } from "./model/Product.js";
 import { Cart } from "./model/Cart.js";
-
+import { Order } from "./model/Order.js";
+import cron from "node-cron"
 const app = express();
 app.use(express.json());
 
-app.post("/seed/product", async (req, res) => {
+
+app.post("/product", async (req, res) => {
+  res.json(await Product.create(req.body));
+});
+
+app.get("/token", async (req, res) => {
+  try {
+    const stockStatus = {};
+
+    // Get all stock-related keys
+    const keys = await redis.keys("stock:*");
+
+    for (const key of keys) {
+      // Skip sequence counters
+      if (key.startsWith("stock:seq:")) continue;
+
+      const productId = key.replace("stock:", "");
+
+      // This key is guaranteed to be a LIST now
+      const tokens = await redis.lrange(key, 0, -1);
+
+      stockStatus[productId] = {
+        availableCount: tokens.length,
+        availableTokens: tokens
+      };
+    }
+
+    // Active reservations
+    const reservationKeys = await redis.keys("reservation:*:data");
+    const reservations = {};
+
+    for (const key of reservationKeys) {
+      const orderId = key.split(":")[1];
+      const data = await redis.get(key);
+      if (!data) continue;
+
+      reservations[orderId] = JSON.parse(data);
+    }
+
+    res.json({
+      stock: stockStatus,
+      activeReservations: reservations
+    });
+  } catch (err) {
+    console.error("Token status error:", err);
+    res.status(500).json({ message: "Failed to fetch token status" });
+  }
+});
+
+
+
+app.post("/product/seed", async (req, res) => {
+  console.log(req.body);
+  
   const { productId, quantity } = req.body;
 
-  if (!productId || !quantity || quantity <= 0) {
-    return res.status(400).json({ message: "Invalid input" });
-  }
-
-  const existing = await redis.llen(`stock:${productId}`);
-  if (existing > 0) {
-    return res.json({ message: "Already seeded" });
-  }
-
+  const tokens = [];
   for (let i = 0; i < quantity; i++) {
-    await redis.rpush(`stock:${productId}`, randomUUID());
+    const seq = await redis.incr(`stock:seq:${productId}`);
+    tokens.push(`${productId}-${seq}`);
   }
 
-  res.json({ message: "Stock seeded", quantity });
+  await redis.rpush(`stock:${productId}`, ...tokens);
+  res.json({ message: "Stock seeded", tokens });
+});
+
+
+app.post("/cart", async (_, res) => {
+  res.json(await Cart.create({ items: [] }));
 });
 
 app.post("/cart/add", async (req, res) => {
-  const { userId, productId, quantity } = req.body;
+  const { cartId, productId, quantity } = req.body;
+  const cart = await Cart.findById(cartId);
+  cart.items.push({ productId, quantity });
+  await cart.save();
+  res.json(cart);
+});
 
-  if (!userId || !productId || !quantity || quantity <= 0) {
-    return res.status(400).json({ message: "Invalid input" });
-  }
 
-  const token = await redis.eval(
-    RESERVE_LUA,
-    1,
-    `stock:${productId}`,
-    quantity
+app.post("/checkout", async (req, res) => {
+  const { cartId } = req.body;
+  const cart = await Cart.findById(cartId);
+  const reservationKey = `reservation:${cartId}`;
+  const args = [reservationKey, 60];
+  cart.items.forEach(i =>
+    args.push(i.productId.toString(), i.quantity)
   );
-
-  if (!token) {
+  const result = await redis.eval(RESERVE_STOCK_LUA, 0, ...args);
+  if (!result) {
     return res.status(409).json({ message: "Out of stock" });
   }
-
-  const reservationKey = `reserve:${userId}:${productId}`;
-  const ttlSeconds = 300;
-
-  await redis.set(reservationKey, token, "EX", ttlSeconds);
-
-  const cart = await Cart.create({
-    userId,
-    productId,
-    quantity,
-    redisReservationKey: reservationKey,
-    reservedToken: token,
-    status: "active",
-    expireAt: new Date(Date.now() + ttlSeconds * 1000)
-  });
-
-  res.json({
-    message: "Added to cart",
-    cartId: cart._id,
-    expiresIn: ttlSeconds
-  });
-});
-
-app.post("/order/create", async (req, res) => {
-  const { cartId } = req.body;
-
-  if (!cartId) {
-    return res.status(400).json({ message: "Invalid input" });
-  }
-
-  const cart = await Cart.findOneAndUpdate(
-    { _id: cartId, status: "active" },
-    { status: "checkout" },
-    { new: true }
-  );
-
-  if (!cart) {
-    return res.status(400).json({ message: "Cart is not active" });
-  }
-
-  const reservation = await redis.get(cart.redisReservationKey);
-  if (!reservation || reservation !== cart.reservedToken) {
-    cart.status = "expired";
-    await cart.save();
-    return res.status(409).json({ message: "Reservation expired" });
-  }
+  const parsed = JSON.parse(result);
 
   const order = await Order.create({
-    userId: cart.userId,
-    productId: cart.productId,
     cartId: cart._id,
-    quantity: cart.quantity,
-    amount: cart.quantity * 100,
-    status: "pending_payment",
-    razorpayOrderId: null,
-    paymentId: null
+    items: cart.items.map(i => ({
+      productId: i.productId,
+      quantity: i.quantity,
+      tokens: parsed[i.productId]
+    }))
   });
 
-  res.json({
-    message: "Order created successfully",
-    orderId: order._id
-  });
+  res.json({ orderId: order._id, expiresIn: 60 });
 });
 
-app.post("/checkout/payment", async (req, res) => {
-  const { cartId } = req.body;
 
-  if (!cartId) {
-    return res.status(400).json({ message: "Invalid input" });
-  }
+app.post("/payment/success", async (req, res) => {
+  const order = await Order.findById(req.body.orderId);
+  order.status = "PAID";
+  await order.save();
+  await redis.del(`reservation:${order.cartId}`);
+  await redis.del(`reservation:${order.cartId}:data`);
 
-  const cart = await Cart.findById(cartId);
-  if (!cart || cart.status !== "checkout") {
-    return res.status(400).json({ message: "Invalid cart" });
-  }
-
-  res.json({ message: "Payment initiated" });
+  res.json({ message: "Payment success" });
 });
 
-app.post("/payment/verify", async (req, res) => {
-  const { orderId } = req.body;
-
-  if (!orderId) {
-    return res.status(400).json({ message: "Invalid input" });
+app.post("/payment/fail", async (req, res) => {
+  const order = await Order.findById(req.body.orderId);
+  const data = await redis.get(`reservation:${order.cartId}:data`);
+  if (data) {
+    await redis.eval(REVOKE_STOCK_LUA, 0, data);
+    await redis.del(`reservation:${order.cartId}:data`);
   }
-
-  const order = await Order.findById(orderId);
-  if (!order) {
-    return res.status(404).json({ message: "Order not found" });
-  }
-
-  if (order.status === "paid") {
-    return res.json({ message: "Already processed" });
-  }
-
-  if (order.status !== "pending_payment") {
-    return res.status(400).json({ message: "Invalid order state" });
-  }
-
-  order.status = "paid";
+  await redis.del(`reservation:${order.cartId}`);
+  order.status = "CANCELLED";
   await order.save();
 
-  await redis.del(`reserve:${order.userId}:${order.productId}`);
-
-  res.json({ message: "Payment successful" });
+  res.json({ message: "Payment failed, stock returned" });
 });
 
-cron.schedule("*/1 * * * *", async () => {
-  try {
-    const now = new Date();
 
-    const expiredCarts = await Cart.find({
-      status: "active",
-      expireAt: { $lte: now }
-    });
+subscriber.subscribe("__keyevent@0__:expired");
+subscriber.on("message", async (_, key) => {
+  if (!key.startsWith("reservation:")) return;
+  console.log("send backed");
+  
+  const orderId = key.split(":")[1];
+  const dataKey = `reservation:${orderId}:data`;
 
-    for (const cart of expiredCarts) {
-      if (cart.status !== "active") continue;
+  const data = await redis.get(dataKey);
+  if (!data) return;
 
-      await redis.eval(
-        ROLLBACK_LUA,
-        1,
-        `stock:${cart.productId}`,
-        cart.quantity
-      );
+  await redis.eval(REVOKE_STOCK_LUA, 0, data);
+  await redis.del(dataKey);
 
-      await redis.del(cart.redisReservationKey);
+  console.log("Expiry cleanup:", orderId);
+});
+function startCleanupCron() {
 
-      cart.status = "expired";
-      await cart.save();
+  cron.schedule("0 * * * *", async () => {
+    console.log("started");
+    
+    const keys = await redis.keys("reservation:*:data");
+
+    for (const key of keys) {
+      const orderId = key.split(":")[1];
+      const active = await redis.exists(`reservation:${orderId}`);
+      if (active) continue;
+      const data = await redis.get(key);
+      if (!data) continue;
+      await redis.eval(REVOKE_STOCK_LUA, 0, data);
+      await redis.del(key);
+      console.log("Cron cleanup:", orderId);
     }
-  } catch (err) {
-    console.error("Cron error:", err);
-  }
-});
+  });
+}
+
 
 async function start() {
   await ConnectDb();
-  app.listen(8000, () => {
-    console.log("started");
-  });
+  startCleanupCron();
+  app.listen(8000, () => console.log("Server running on 8000"));
 }
 
 start();

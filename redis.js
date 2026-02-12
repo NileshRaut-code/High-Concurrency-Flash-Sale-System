@@ -1,7 +1,8 @@
 import Redis from 'ioredis'
 
-const redis=new Redis()
-  
+const redis=new Redis("redis://localhost:6379")
+redis.config("SET", "notify-keyspace-events", "Ex")
+ const subscriber = new Redis("redis://loclhost:6379");
 redis.on("connect",()=>{
    console.log("redis conected");
 })
@@ -12,4 +13,4 @@ redis.on("error",()=>{
    console.log("redis error");
 })
 
-export {redis}
+export {redis,subscriber}

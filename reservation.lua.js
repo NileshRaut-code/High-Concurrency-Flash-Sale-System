@@ -1,34 +1,45 @@
-// Atomic stock reservation Lua script
-export const RESERVE_LUA = `
--- KEYS[1] -> stock key (stock:productId)
--- ARGV[1] -> quantity to reserve
+export const RESERVE_STOCK_LUA = `
+-- ARGV[1] = reservation key
+-- ARGV[2] = ttl
+-- ARGV[3...] = productId, qty pairs
 
-local stockKey = KEYS[1]
-local quantity = tonumber(ARGV[1])
+local reservationKey = ARGV[1]
+local ttl = tonumber(ARGV[2])
+local result = {}
 
-local available = redis.call("LLEN", stockKey)
-if available < quantity then
-  return nil
+-- CHECK
+for i = 3, #ARGV, 2 do
+  local pid = ARGV[i]
+  local qty = tonumber(ARGV[i+1])
+  if redis.call("LLEN", "stock:"..pid) < qty then
+    return nil
+  end
 end
 
-local token = redis.call("INCR", "reservation:counter")
+-- RESERVE
+for i = 3, #ARGV, 2 do
+  local pid = ARGV[i]
+  local qty = tonumber(ARGV[i+1])
 
-for i = 1, quantity do
-  redis.call("RPOP", stockKey)
+  local tokens = redis.call("LRANGE", "stock:"..pid, 0, qty-1)
+  redis.call("LTRIM", "stock:"..pid, qty, -1)
+
+  result[pid] = tokens
 end
 
-return tostring(token)
+redis.call("SET", reservationKey, "1", "EX", ttl)
+redis.call("SET", reservationKey..":data", cjson.encode(result))
+
+return cjson.encode(result)
 `;
-// Atomic rollback Lua script
-export const ROLLBACK_LUA = `
--- KEYS[1] -> stock key (stock:productId)
--- ARGV[1] -> quantity to rollback
 
-local stockKey = KEYS[1]
-local quantity = tonumber(ARGV[1])
+export const REVOKE_STOCK_LUA = `
+local data = cjson.decode(ARGV[1])
 
-for i = 1, quantity do
-  redis.call("LPUSH", stockKey, "rollback")
+for pid, tokens in pairs(data) do
+  for i = 1, #tokens do
+    redis.call("RPUSH", "stock:"..pid, tokens[i])
+  end
 end
 
 return true
